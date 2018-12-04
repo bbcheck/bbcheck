@@ -43,18 +43,12 @@ authorization to the boot node.
 Configuration Settings
 ======================
 
-- `DW_NODE_PREFIX` : The prefix used in the numerical naming of your system's
-   burst buffer nodes. For example, in the default configuration where the 214th burst buffer node is `bb214` the prefix would be "bb".
+- DW_NODE_PREFIX : The prefix used in the numerical naming of your system's burst buffer nodes. For example, in the default configuration where the 214th burst buffer node is `bb214` the prefix would be "bb".
+- DWSTAT_PATH : The path of the Cray `dwstat` tool on the boot node.
+- BOOT_NODE_NAME : The name of the boot node.  The default is `boot`.
+- DWSTAT_AUTHORIZED_USER : The username of of a user that has permission to ssh into the boot node (if running the tool on the SMW) and to run `dwstat`.
+- SMW_HOSTNAME : The hostname of your system's SMW node.
 
-- `DWSTAT_PATH` : The path of the Cray `dwstat` tool on the boot node.
-
-- `BOOT_NODE_NAME` : The name of the boot node.  The default is `boot`.
-
-- `DWSTAT_AUTHORIZED_USER` : The username of of a user that has permission to
-   ssh into the boot node(if running the tool on the SMW) and to run `dwstat`.
-
-- `SMW_HOSTNAME` : The hostname of your system's SMW node.
-|
 Running The Tool
 ================
 
