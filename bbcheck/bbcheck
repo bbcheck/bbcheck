@@ -1,0 +1,740 @@
+#!/usr/bin/python
+# pylint: disable=global-variable-undefined, relative-import
+# This program is licensed under the Lawrence Berkeley National Labs BSD variantlicense.
+#Please see the LICENSE file for further details.
+"""
+Author: John Gann
+Advisor: Tony Quan
+Last updated: 10/27/18
+Displays current state of datawarp nodes, as well as a hierarchical view of datawarp sessions
+Run bbcheck --help for further information
+"""
+
+from __future__ import print_function
+from socket import gethostname
+
+import re
+import subprocess
+import sys
+
+try:
+    import bbconfig
+except ImportError:
+    import bbcheck.bbconfig as bbconfig
+
+try:
+    import demo_strings
+    DEMO_AVAILABLE = True
+except ImportError:
+    try:
+        import bbcheck.demo_strings as demo_strings
+        DEMO_AVAILABLE = True
+    except ImportError:
+        DEMO_AVAILABLE = False
+
+
+
+
+class Entity(object):
+    """
+    This class represents some kind of entity in the datawarp structure, sucah as an
+    instance, session, configuration, registration, fragment, or activation.  As such
+    it contains most of the logic for extracting the DWSTAT data an building out a hierachical
+    model of these structures for any given run.  Since datawarp entities can relate to each other
+    in different ways (please refer to the crow's-foot diagram in the DWSTAT handbook), methods
+    are left flexible and generic
+    """
+    tags = {'activation':'activ',
+            'registration':'reg',
+            'configuration':'conf',
+            'session':'sess',
+            'instance':'inst',
+            'fragment':'frag',
+            'namespace':'nss'}
+
+
+    def __init__(self, data_line, data):
+        """
+        class_name is set to avoid having long branching conditionals
+        full of isinstance statements. Since the data being displayed
+        actually reflects the interrelation of objects
+        """
+        self.class_name = self.__class__.__name__.lower()
+        self.entity_id = data_line[Entity.tags[self.class_name]]
+        self.data_line = data_line
+        self.data = data
+        self.has_problem = False
+        self.initialize_vars()
+
+
+    def print_self(self, indent_level=0, *additional_strings):
+        """
+        This is a generic print statement.  All entities have at least an ID, state, and name.
+        This method is overridden in subclasses when it needs to display specialized info
+        """
+        print_string = ("\t" * indent_level + self.class_name.title() +
+                        " ID:" + self.entity_id + "\tState:" + self.data_line["state"])
+        for string in additional_strings:
+            print_string = print_string + string
+        if self.is_problem:
+            print_bad(print_string)
+        elif self.has_problem:
+            print_somewhat_problematic(print_string)
+        else:
+            print_ok(print_string)
+
+    def does_self_have_problem(self):
+        """
+        Assesses whether the entity the object represents or a subordinate object
+        is in a D, F, or C  state. Even if the object has an issues, subordinate states
+        are still checked as a side effect for display purposes
+        """
+        self.is_problem = ("D" in self.data_line["state"] or "F" in self.data_line["state"])
+        if self.is_problem:
+            self.has_problem = True
+            self.does_subordinate_have_problem()
+            return True
+        self.has_problem = ("C" in self.data_line["state"] and
+                            self.data_line["state"].find("CA") == -1)
+        self.has_problem = self.does_subordinate_have_problem() or self.has_problem
+        return self.has_problem
+
+    def does_subordinate_have_problem(self):
+        """
+        Assess whether some entity falling under this entity in the hierarchy is in a
+        C, D, or F state
+        """
+        potential_properties = set([key + "s" for key in Entity.tags])
+        vals_to_probe = potential_properties.intersection(set(self.__dict__))
+        return_value = False
+        collected_subordinates = []
+        for entry in vals_to_probe:
+            collected_subordinates += self.__dict__[entry]
+        for entity in collected_subordinates:
+            return_value = (entity.does_self_have_problem() or return_value)
+        return return_value
+
+    def initialize_vars(self):
+        """
+        In subclasses, this method initializes variables necessary for assessing
+        and displaying entity-type-specific information.  Since it's called in
+        __init__ in this superclass, it needs this blank implementation for
+        when subclasses do not implement their own versions
+        """
+        pass
+
+    def get_xs_by_ys(self, entity_type_x, entity_type_y):
+        """
+        Finds all of entity type X belonging to entity type Y in the DWSTAT data.
+        This method is left super to avoid having repetitive but not identical
+        code in the subclasses
+        """
+        dataset_name = "by" + entity_type_x.title()
+        entity1_tag = Entity.tags[entity_type_y]
+        return_list = []
+        for row in self.data[dataset_name]:
+            if entity1_tag in row and row[entity1_tag] == self.entity_id:
+                return_list.append(row)
+        return return_list
+
+    def get_subordinate_xs(self, entity_type_x):
+        """
+        Finds all subordinates of this class of type x in the dwstat data
+        """
+        entity_type_y = self.class_name
+        return self.get_xs_by_ys(entity_type_x, entity_type_y)
+
+    def make_subordinate_entities(self, entity_class):
+        """
+        Create subordinate objects of a specific type
+        """
+        id_list = self.get_subordinate_xs(entity_class.__name__.lower())
+        return [entity_class(ID, self.data) for ID in id_list]
+
+    def add_instances_from_table(self):
+        """
+        Add (dw) instances
+        """
+        self.instances = self.make_subordinate_entities(Instance)
+
+    def add_registrations_from_table(self):
+        """
+        Add registrations
+        """
+        self.registrations = self.make_subordinate_entities(Registration)
+
+    def add_configurations_from_table(self):
+        """
+        Add configurations
+        """
+        self.configurations = self.make_subordinate_entities(Configuration)
+
+    def add_activations_from_table(self):
+        """
+        Add activations
+        """
+        self.activations = self.make_subordinate_entities(Activation)
+
+    def add_fragments_from_table(self):
+        """
+        Add fragments
+        """
+        self.fragments = self.make_subordinate_entities(Fragment)
+
+    def add_namespaces_from_table(self):
+        """
+        Add namespaces
+        """
+        self.namespaces = self.make_subordinate_entities(Namespace)
+
+    def print_title_line(self, sub_set, indent_level):
+        """
+        Prints header line indicating subentities of a particular type belonging to this entity
+        """
+        if sub_set:
+            sub_member_name = sub_set[0].class_name
+            if len(sub_set) > 1:
+                sub_member_name = sub_member_name+"s"
+            print_underlined("\t" * indent_level + "This " + self.class_name +
+                             " contains the following " + sub_member_name + ":")
+
+
+class Session(Entity):
+    """
+    Subclass of entity containing logic specific to DW sessions
+    """
+
+    def initialize_vars(self):
+        """
+        Adds everything that can be subordinate to a session
+        """
+        self.add_instances_from_table()
+        self.add_registrations_from_table()
+        self.add_activations_from_table()
+
+    def add_registrations_from_table(self):
+        """
+        Overrides the superclass implementation, to make sure registration is not also
+        claimed by a configuration
+        """
+        self.registrations = []
+        for row in self.data["byRegistration"]:
+            if not re.match("[1-9][0-9]{0, 7}", row[Entity.tags["configuration"]]):
+                if row[Entity.tags[self.class_name]] == self.entity_id:
+                    self.registrations.append(Registration(row, self.data))
+
+    def print_self(self, indent_level=0, *additional_strings):
+        """
+        Overrides the superclass implementation to ensure session specific
+        information is displayed
+        """
+        num_nodes = sum([len(instance.fragments) for instance in self.instances])
+        print("")
+        Entity.print_self(self, indent_level, ("\tToken:" + self.data_line["token"] +
+                                               "\tUID:" + self.data_line["owner"] +
+                                               "\tDW-Nodes:" + str(num_nodes)))
+        self.print_title_line(self.instances, indent_level)
+        for instance in self.instances:
+            instance.print_self(indent_level + 1)
+        self.print_title_line(self.registrations, indent_level)
+        for registration in self.registrations:
+            registration.print_self(indent_level + 1)
+        self.print_title_line(self.activations, indent_level)
+        for activation in self.activations:
+            activation.print_self(indent_level + 1)
+
+class Instance(Entity):
+    """
+    Subclass representing the instance entity type
+    """
+
+    def initialize_vars(self):
+        """
+        Adds subclasses specific to DW instances and computes the total size of the
+        instances based on the cumulative size of its fragments
+        """
+        self.add_fragments_from_table()
+        self.add_configurations_from_table()
+        self.data_line["size"] = sum([fragment.get_size_in_tebibytes()
+                                      for fragment in self.fragments])
+
+    def print_self(self, indent_level=0, *additional_strings):
+        """
+        Overrides superclass implementation in order to display instance-specific data,
+        and to change formatting to display fragments
+        """
+        Entity.print_self(self, indent_level, ("\tMDS Node:" + self.data_line["MDS Node"] +
+                                               "\tSize:" + str(self.data_line["size"]) + " TiB"))
+        print_underlined("\t" * indent_level + "State of this instance's fragments")
+        self.print_frags(indent_level)
+        self.print_title_line(self.configurations, indent_level)
+        for configuration in self.configurations:
+            configuration.print_self(indent_level + 1)
+
+    def print_frags(self, indent_level):
+        """
+        Identifies ranges of fragments in good or bad states and displays them
+        """
+        bad_frags = [fragment for fragment in self.fragments if fragment.has_problem]
+        good_frags = [int(fragment.entity_id) for fragment in self.fragments
+                      if not fragment.has_problem]
+        good_frags.sort()
+        good_pairs = []
+        if good_frags:
+            good_pair = [good_frags[0], good_frags[0]]
+            for i in good_frags[1:]:
+                if i - 1 == good_pair[1]:
+                    good_pair[1] = i
+                else:
+                    good_pairs.append(good_pair)
+                    good_pair = [i, i]
+            good_pairs.append(good_pair)
+        for i, j in enumerate(good_pairs):
+            if j[0] == j[1]:
+                good_pairs[i] = str(j[0])
+            else:
+                good_pairs[i] = str(j[0]) + "-" + str(j[1])
+        if good_pairs:
+            print_ok("\t" * (indent_level + 1) + "Fragments " + ", ".join(good_pairs) + " are OK!")
+        for fragment in bad_frags:
+            fragment.print_self(indent_level + 1)
+
+
+
+
+class Configuration(Entity):
+    """
+    Subclass to represent the configuration DW entity
+    """
+    def initialize_vars(self):
+        """
+        Populates with all subordinate types a configuration may have
+        """
+        self.add_registrations_from_table()
+        self.add_namespaces_from_table()
+
+    def add_registrations_from_table(self):
+        """
+        Overrides superclass implementation to resolve hierachical subordination conflicts
+        """
+        self.registrations = []
+        for row in self.data["byRegistration"]:
+            if re.match("[1-9][0-9]{0, 7}", row[Entity.tags["configuration"]]):
+                if row[Entity.tags[self.class_name]] == self.entity_id:
+                    self.registrations.append(Registration(row, self.data))
+
+    def print_self(self, indent_level=0, *additional_strings):
+        """
+        Adds logic to the superclass implementation
+        """
+        Entity.print_self(self, indent_level)
+        self.print_title_line(self.registrations, indent_level)
+        for registration in self.registrations:
+            registration.print_self(indent_level + 1)
+        self.print_title_line(self.namespaces, indent_level)
+        for namespace in self.namespaces:
+            namespace.print_self(indent_level + 1)
+
+class Registration(Entity):
+    """
+    Object type representing DW registrations
+    """
+
+    def initialize_vars(self):
+        """
+        Adds all entities the can be subordinate to registrations.
+        """
+        self.add_activations_from_table()
+
+    def print_self(self, indent_level=0, *additional_strings):
+        """
+        Adds registration-specific logic to display method
+        """
+        Entity.print_self(self, indent_level)
+        self.print_title_line(self.activations, indent_level)
+        for activation in self.activations:
+            activation.print_self(indent_level + 1)
+
+class Activation(Entity):
+    """
+    Subclass representing DW activations
+    """
+    pass
+
+class Fragment(Entity):
+    """
+    Subclass representing DW fragments
+    """
+
+    def get_size_in_tebibytes(self):
+        """
+        Returns fragment size in tebibytes
+        """
+        return float(self.data_line["capacity"][:-3]) / 1024.0
+
+    def print_self(self, indent_level=0, *additional_strings):
+        """
+        Adds logic specific to displaying fragments.
+        """
+        Entity.print_self(self, indent_level, "\tNode:" + self.data_line["node"])
+
+class Namespace(Entity):
+    """
+    Subclass representing DW namespaces
+    """
+    pass
+
+class Colors(object):
+    """
+    Class containing terminal color and markup codes as static members
+    """
+    PURPLE = '\033[95m'
+    CYAN = '\033[96m'
+    DARKCYAN = '\033[36m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+def columnar_output_to_table(tool_output_text):
+    """
+    Translates columnar terminal output to a list of python dictionaries, with each datum
+    keyed by the heading it falls under
+    """
+    lines = tool_output_text.splitlines()
+    headings = lines[0].split()
+    data = [line.split() for line in lines[1:]]
+    for i, line in enumerate(data):
+        sub_dict = {}
+        for j, field in enumerate(line):
+            sub_dict[headings[j]] = field
+        if sub_dict:
+            data[i] = sub_dict
+    data = filter(len, data)
+    return data
+
+def get_testing_data(key):
+    """
+    Fetches data representing problems for testing bbcheck
+    """
+    return demo_strings.data[key]
+
+def get_raw_dwstat_output():
+    """
+    Gets data from DWSTAT (or alternatively from testing files). Returns a dictionary
+    keyed by table subject in the output
+    """
+    return_dict = {}
+    keys = ['node', 'activation', 'registration', 'fragment',
+            'instance', 'session', 'configuration', 'namespace']
+    if DEMO_FLAG_SET:
+        if not DEMO_AVAILABLE :
+            print("Demo data is not available")
+            exit()
+        for key in keys:
+            return_dict["by" + key.title()] = get_testing_data(key)
+    else:
+        if bbconfig.SMW_HOSTNAME in gethostname():
+            data = subprocess.check_output("ssh " + bbconfig.DWSTAT_AUTHORIZED_USER +
+                                           "@" + bbconfig.BOOT_NODE_NAME + " " +
+                                           bbconfig.DWSTAT_PATH + " -g all", shell=True)
+        else:
+            data = subprocess.check_output(bbconfig.DWSTAT_PATH + " -g all", shell=True)
+        data = data.split("\n\n")
+        re_dict = {"node": "Node",
+                   "activ": "Activation",
+                   "reg": "Registration",
+                   "frag": "Fragment",
+                   "inst": "Instance",
+                   "sess": "Session",
+                   "conf": "Configuration",
+                   "nss": "Namespace"}
+        for key in re_dict:
+            return_dict["by" + re_dict[key]] = " "
+        for key in re_dict:
+            re_dict["^\\s*" + key] = re_dict[key]
+            del re_dict[key]
+        for chunk in data:
+            for key in re_dict:
+                if re.match(key, chunk):
+                    return_dict["by" + re_dict[key]] = chunk
+    return return_dict
+
+def expand_node_notation(data_dict):
+    """
+    Expands node nomenclature to represent all three name types (nid, c-name, and bb-)
+    """
+    for i, j in enumerate(data_dict["byFragment"]):
+        node = j["node"]
+        if node in NODE_DICT:
+            expanded_node = node + "/" + NODE_DICT[node][0] + "/" + NODE_DICT[node][1]
+        else:
+            expanded_node = node
+        data_dict["byFragment"][i]["node"] = expanded_node
+
+def tabularize(raw_data):
+    """
+    Translates columnar text chunks into lists of dicts
+    """
+    return_dict = dict(raw_data)
+    for key in return_dict:
+        return_dict[key] = columnar_output_to_table(return_dict[key])
+    expand_node_notation(return_dict)
+    add_mds_nodes(return_dict)
+    return return_dict
+
+def get_headers(raw_data):
+    """
+    Gets headers of tables displayed by DWSTAT
+    """
+    return_dict = {}
+    for key in raw_data:
+        return_dict[key] = raw_data[key][:raw_data[key].find("\n")].split()
+    return return_dict
+
+def is_in_valid_pool(node_line):
+    """
+    Checks if node is a production pool
+    """
+    pool = node_line["pool"]
+    in_valid_pool = (pool == "wlm_pool")
+    in_valid_pool = in_valid_pool or (pool == "sm_pool")
+    in_valid_pool = in_valid_pool or (pool == "dev_pool")
+    return in_valid_pool
+
+def get_nonpooled_and_pooled_nodes(data_dict):
+    """
+    Sorts nodes into valid and invalid pool membership
+    """
+    nonpooled = [node for node in data_dict["byNode"] if not is_in_valid_pool(node)]
+    pooled = filter(is_in_valid_pool, data_dict["byNode"])
+    return nonpooled, pooled
+
+def get_offline_nodes(data_dict):
+    """
+    Identifies bb nodes that are not online
+    """
+    return [node for node in data_dict["byNode"] if "online" not in node["online"]
+            and "true" not in node["online"]]
+def get_drained_nodes(data_dict):
+    """
+    Identifies drained nodes
+    """
+    return [node for node in data_dict["byNode"] if node["drain"] == "drain"]
+
+
+
+def get_instance_head_nodes(data_dict):
+    """
+    Finds the head node of a give instance
+    """
+    instance_dict = {}
+    for row in data_dict["byFragment"]:
+        if row["inst"] not in instance_dict:
+            instance_dict[row["inst"]] = []
+        instance_dict[row["inst"]].append((row["frag"], row["node"]))
+    for instance in instance_dict:
+        temp_list = instance_dict[instance]
+        temp_list.sort(key=lambda x: x[0])
+        instance_dict[instance] = temp_list[0][1]
+    return instance_dict
+
+def add_mds_nodes(data_dict):
+    """
+    Adds metadata server nodes to the data available
+    """
+    instance_mds_dict = get_instance_head_nodes(data_dict)
+    for rownum, row in enumerate(data_dict["byInstance"]):
+        data_dict["byInstance"][rownum]["MDS Node"] = instance_mds_dict[row["inst"]]
+
+def print_ok(string):
+    """
+    Print things in an acceptable state. Uses colorcoding when not disabled by
+    command-line flag
+    """
+    if MONOCHROME_FLAG_SET:
+        print(string)
+    else:
+        print(Colors.GREEN + Colors.BOLD + string + Colors.END)
+
+def print_bad(string):
+    """
+    Prints things in bad state. Uses color coding when not disabled
+    """
+    if MONOCHROME_FLAG_SET:
+        print(string)
+    else:
+        print(Colors.RED + Colors.BOLD + string + Colors.END)
+
+def print_underlined(string):
+    """
+    Prints underlined strings.  Does not underline leading whitespace
+    """
+    stripped_string = string.strip()
+    leading_white_space = string[:string.find(stripped_string)]
+    print(leading_white_space + Colors.UNDERLINE + stripped_string + Colors.END)
+
+def print_somewhat_problematic(string):
+    """
+    For printing things in a quasibad state. Uses color when not specifically disabled
+    """
+    if MONOCHROME_FLAG_SET:
+        print(string)
+    else:
+        print(Colors.YELLOW + Colors.BOLD + string + Colors.END)
+
+def print_tabular_data(data, header_order):
+    """
+    Prints data in shell columnar output form
+    """
+    if not data:
+        return
+    header_row = {}
+    for i in header_order:
+        header_row[i] = i
+    data.insert(0, header_row)
+    rows = []
+    for row in data:
+        field_list = []
+        for header in header_order:
+            if header in row:
+                field_list.append(row[header])
+
+        rows.append("/".join(field_list))
+    print_table = '\"' + "\n".join(rows) + '\"'
+    formatted_table = subprocess.check_output('echo '+print_table+" | column -ts '/'", shell=True)
+    print_bad(formatted_table[:-1])
+
+
+def get_erroneous(data):
+    """
+    Finds lines in an erroneous state for the classic output option
+    """
+    return_dict = {}
+    for key in data:
+        if data[key] and "state" in data[key][0]:
+            return_dict[key] = []
+            for row in data[key]:
+                if row["state"].find("D") > -1 or row["state"].find("F") > -1:
+                    return_dict[key].append(row)
+            if not return_dict[key]:
+                del return_dict[key]
+    return return_dict
+
+def print_node_data():
+    """
+    Prints node information
+    """
+    if not DRAINED_NODES:
+        print_ok("There are no drained nodes")
+    else:
+        print_bad("The following nodes are drained:")
+        print_tabular_data(DRAINED_NODES, HEADERS["byNode"])
+    print("")
+    if not OFFLINE_NODES:
+        print_ok("There are no offline nodes")
+    else:
+        print_bad("The following nodes are offline:")
+        print_tabular_data(OFFLINE_NODES, HEADERS["byNode"])
+    print("")
+    if not NONPOOLED_NODES:
+        print_ok("All nodes are in appropriate pools")
+    else:
+        print_bad("The following nodes are not in appropriate pools")
+        print_tabular_data(NONPOOLED_NODES, HEADERS["byNode"])
+    print("")
+
+def hierarchy_output():
+    """
+    Outputs DWSTAT information in a hierarchial way
+    """
+    sessions = []
+    for row in TABULARIZED_DATA["bySession"]:
+        new_session = Session(row, TABULARIZED_DATA)
+        new_session.does_self_have_problem()
+        sessions.append(new_session)
+    for session in sessions:
+        if SHOW_ALL_FLAG_SET or session.has_problem:
+            session.print_self()
+
+def classic_output():
+    """
+    Performs as requested by the original specification.  With this option, output is
+    not hierarchical, but rather a filtered version of DWSTAT
+    """
+    error_data = get_erroneous(TABULARIZED_DATA)
+    for key in HEADERS:
+        if key not in error_data:
+            print_ok("There are no " + key[2:].lower() + "s in a bad state.\n")
+        else:
+            print_bad("Bad " + key[2:] + "s:")
+            print_tabular_data(error_data[key], HEADERS[key])
+
+
+
+def set_flags_from_arguments():
+    """
+    Sets global variables based on command line arguments.
+    """
+    args = " ".join(sys.argv[1:])
+    global MONOCHROME_FLAG_SET
+    global CLASSIC_FLAG_SET
+    global SHOW_ALL_FLAG_SET
+    global DEMO_FLAG_SET
+    DEMO_FLAG_SET = bool(re.match('.*--testing.*', args))
+    if DEMO_FLAG_SET:
+        print("DEMO")
+    MONOCHROME_FLAG_SET = bool(re.match(r'-\S*m\S*', args))
+    CLASSIC_FLAG_SET = bool(re.match(r'-\S*c\S*', args))
+    SHOW_ALL_FLAG_SET = bool(re.match(r'-\S*a\S*', args))
+    if not DEMO_FLAG_SET and re.match(r'-\S*[^acm]\S*', args):
+        print ("usage: bbcheck [-acmp]")
+        print ("Options and arguments:")
+        print ("-a\t: prints all sessions, not just those in error. Ignored if used with -c")
+        print ("-c\t: prints BB information in the same format as DWSTAT," +
+               " rather than as a hierarchy")
+        print ("-m\t: prints data in monochrome, rather than color. Useful to keep terminal " +
+               " escape sequences out of data.")
+        print ("--testing\t: Displays a demo")
+        sys.exit()
+
+
+def set_globals():
+    """
+    Sets globals. Some globals are set by the call to set_flags_from_arguments
+    """
+    global TABULARIZED_DATA
+    global HEADERS
+    global DRAINED_NODES
+    global OFFLINE_NODES
+    global NONPOOLED_NODES
+    global POOLED_NODES
+    global NODE_DICT
+    node_list = subprocess.check_output("ssh " + bbconfig.DWSTAT_AUTHORIZED_USER +
+                                        "@" + bbconfig.BOOT_NODE_NAME + " cat /etc/hosts | grep " +
+                                        bbconfig.DW_NODE_PREFIX, shell=True)
+    node_list = node_list.splitlines()
+    node_list = [x.split() for x in node_list]
+    NODE_DICT = {}
+    for entry in node_list:
+        NODE_DICT[entry[1]] = [entry[2], entry[3]]
+    set_flags_from_arguments()
+    raw_data = get_raw_dwstat_output()
+    TABULARIZED_DATA = tabularize(raw_data)
+    HEADERS = get_headers(raw_data)
+    DRAINED_NODES = get_drained_nodes(TABULARIZED_DATA)
+    OFFLINE_NODES = get_offline_nodes(TABULARIZED_DATA)
+    NONPOOLED_NODES, POOLED_NODES = get_nonpooled_and_pooled_nodes(TABULARIZED_DATA)
+
+
+if __name__ == "__main__":
+    set_globals()
+    print_node_data()
+    if CLASSIC_FLAG_SET:
+        classic_output()
+    else:
+        hierarchy_output()
+    print(Colors.END)
